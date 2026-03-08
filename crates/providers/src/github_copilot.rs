@@ -33,8 +33,9 @@ const GITHUB_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+/// Default API base for individual Copilot accounts.
+/// Enterprise accounts use the endpoint returned in the token response instead.
 const COPILOT_API_BASE: &str = "https://api.individual.githubcopilot.com";
-const COPILOT_MODELS_ENDPOINT: &str = "https://api.individual.githubcopilot.com/models";
 
 const PROVIDER_NAME: &str = "github-copilot";
 
@@ -42,6 +43,9 @@ const PROVIDER_NAME: &str = "github-copilot";
 /// The API rejects requests without `Editor-Version`.
 const EDITOR_VERSION: &str = "vscode/1.96.2";
 const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
+
+/// Token store key for the cached Copilot API endpoint URL.
+const COPILOT_ENDPOINT_STORE_KEY: &str = "github-copilot-endpoint";
 
 // ── Device flow types ────────────────────────────────────────────────────────
 
@@ -63,6 +67,15 @@ struct GithubTokenResponse {
 struct CopilotTokenResponse {
     token: String,
     expires_at: u64,
+    /// Enterprise tokens include an `endpoints` object whose `api` field
+    /// points at the correct proxy (e.g. `proxy.enterprise.githubcopilot.com`).
+    #[serde(default)]
+    endpoints: Option<CopilotEndpoints>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CopilotEndpoints {
+    api: Option<String>,
 }
 
 // ── Provider ─────────────────────────────────────────────────────────────────
@@ -139,8 +152,8 @@ impl GitHubCopilotProvider {
         }
     }
 
-    /// Get a valid Copilot API token, exchanging the GitHub token if needed.
-    async fn get_valid_copilot_token(&self) -> anyhow::Result<String> {
+    /// Get a valid Copilot API token and the API base URL to use.
+    async fn get_valid_copilot_token(&self) -> anyhow::Result<(String, String)> {
         fetch_valid_copilot_token_with_fallback(self.client, &self.token_store).await
     }
 }
@@ -193,10 +206,19 @@ pub const COPILOT_MODELS: &[(&str, &str)] = &[
     ("gemini-2.0-flash", "Gemini 2.0 Flash (Copilot)"),
 ];
 
+/// Load the stored API base URL, falling back to the individual endpoint.
+fn stored_api_base(token_store: &TokenStore) -> String {
+    token_store
+        .load(COPILOT_ENDPOINT_STORE_KEY)
+        .map(|t| t.access_token.expose_secret().clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| COPILOT_API_BASE.to_string())
+}
+
 async fn fetch_valid_copilot_token(
     client: &reqwest::Client,
     token_store: &TokenStore,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, String)> {
     let tokens = token_store.load(PROVIDER_NAME).ok_or_else(|| {
         anyhow::anyhow!("not logged in to github-copilot — run OAuth device flow first")
     })?;
@@ -211,7 +233,11 @@ async fn fetch_valid_copilot_token(
             .unwrap_or_default()
             .as_secs();
         if now + 60 < expires_at {
-            return Ok(copilot_tokens.access_token.expose_secret().clone());
+            let api_base = stored_api_base(token_store);
+            return Ok((
+                copilot_tokens.access_token.expose_secret().clone(),
+                api_base,
+            ));
         }
     }
 
@@ -235,6 +261,18 @@ async fn fetch_valid_copilot_token(
     }
 
     let copilot_resp: CopilotTokenResponse = resp.json().await?;
+
+    // Extract the API base URL from the token response.  Enterprise tokens
+    // include `endpoints.api` pointing at the proxy; individual tokens either
+    // omit it or set it to the default individual endpoint.
+    let api_base = copilot_resp
+        .endpoints
+        .as_ref()
+        .and_then(|e| e.api.clone())
+        .unwrap_or_else(|| COPILOT_API_BASE.to_string());
+
+    debug!(api_base = %api_base, "copilot token exchange: resolved API base");
+
     let _ = token_store.save("github-copilot-api", &OAuthTokens {
         access_token: Secret::new(copilot_resp.token.clone()),
         refresh_token: None,
@@ -243,13 +281,22 @@ async fn fetch_valid_copilot_token(
         expires_at: Some(copilot_resp.expires_at),
     });
 
-    Ok(copilot_resp.token)
+    // Persist the endpoint separately so cached-token lookups can read it back.
+    let _ = token_store.save(COPILOT_ENDPOINT_STORE_KEY, &OAuthTokens {
+        access_token: Secret::new(api_base.clone()),
+        refresh_token: None,
+        id_token: None,
+        account_id: None,
+        expires_at: Some(copilot_resp.expires_at),
+    });
+
+    Ok((copilot_resp.token, api_base))
 }
 
 async fn fetch_valid_copilot_token_with_fallback(
     client: &reqwest::Client,
     primary_store: &TokenStore,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, String)> {
     let Some(token_store) = token_store_with_provider_tokens(primary_store) else {
         anyhow::bail!("not logged in to github-copilot — run OAuth device flow first");
     };
@@ -360,9 +407,11 @@ fn parse_models_payload(value: &serde_json::Value) -> Vec<super::DiscoveredModel
 async fn fetch_models_from_api(
     client: &reqwest::Client,
     access_token: String,
+    api_base: &str,
 ) -> anyhow::Result<Vec<super::DiscoveredModel>> {
+    let url = format!("{api_base}/models");
     let response = client
-        .get(COPILOT_MODELS_ENDPOINT)
+        .get(&url)
         .header("Authorization", format!("Bearer {access_token}"))
         .header("Accept", "application/json")
         .header("Editor-Version", EDITOR_VERSION)
@@ -397,9 +446,9 @@ pub fn start_model_discovery() -> mpsc::Receiver<anyhow::Result<Vec<super::Disco
                         .timeout(Duration::from_secs(8))
                         .build()?;
                     let token_store = TokenStore::new();
-                    let access_token =
+                    let (access_token, api_base) =
                         fetch_valid_copilot_token_with_fallback(&client, &token_store).await?;
-                    fetch_models_from_api(&client, access_token).await
+                    fetch_models_from_api(&client, access_token, &api_base).await
                 })
             });
         let _ = tx.send(result);
@@ -440,6 +489,77 @@ pub fn available_models() -> Vec<super::DiscoveredModel> {
     super::merge_discovered_with_fallback_catalog(discovered, fallback)
 }
 
+/// Consume a streaming response and assemble a [`CompletionResponse`].
+///
+/// Used when the enterprise proxy requires `stream: true` but the caller
+/// invoked the non-streaming `complete()` path.
+async fn collect_stream_response(
+    stream: Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>>,
+) -> anyhow::Result<CompletionResponse> {
+    use moltis_agents::model::{ToolCall, Usage};
+
+    tokio::pin!(stream);
+
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<ToolCallAccumulator> = Vec::new();
+    let mut usage = Usage::default();
+
+    while let Some(event) = stream.next().await {
+        match event {
+            StreamEvent::Delta(t) => text_parts.push(t),
+            StreamEvent::ToolCallStart { id, name, index } => {
+                if index >= tool_calls.len() {
+                    tool_calls.resize_with(index + 1, ToolCallAccumulator::default);
+                }
+                tool_calls[index].id = id;
+                tool_calls[index].name = name;
+            },
+            StreamEvent::ToolCallArgumentsDelta { index, delta } => {
+                if index >= tool_calls.len() {
+                    tool_calls.resize_with(index + 1, ToolCallAccumulator::default);
+                }
+                tool_calls[index].arguments.push_str(&delta);
+            },
+            StreamEvent::Done(u) => {
+                usage = u;
+            },
+            StreamEvent::Error(e) => {
+                anyhow::bail!("{e}");
+            },
+            _ => {},
+        }
+    }
+
+    let text = if text_parts.is_empty() {
+        None
+    } else {
+        Some(text_parts.join(""))
+    };
+
+    let tool_calls: Vec<ToolCall> = tool_calls
+        .into_iter()
+        .filter(|tc| !tc.name.is_empty())
+        .map(|tc| ToolCall {
+            id: tc.id,
+            name: tc.name,
+            arguments: serde_json::from_str(&tc.arguments).unwrap_or_default(),
+        })
+        .collect();
+
+    Ok(CompletionResponse {
+        text,
+        tool_calls,
+        usage,
+    })
+}
+
+#[derive(Default)]
+struct ToolCallAccumulator {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
 // ── LlmProvider impl ────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -461,7 +581,17 @@ impl LlmProvider for GitHubCopilotProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
     ) -> anyhow::Result<CompletionResponse> {
-        let token = self.get_valid_copilot_token().await?;
+        let (token, api_base) = self.get_valid_copilot_token().await?;
+
+        // Enterprise proxy endpoints require streaming; delegate to the
+        // streaming path and collect the result when not on the individual API.
+        if api_base != COPILOT_API_BASE {
+            debug!(api_base = %api_base, "enterprise proxy detected, using streaming for complete()");
+            return collect_stream_response(
+                self.stream_with_tools(messages.to_vec(), tools.to_vec()),
+            )
+            .await;
+        }
 
         let openai_messages: Vec<serde_json::Value> =
             messages.iter().map(ChatMessage::to_openai_value).collect();
@@ -484,7 +614,7 @@ impl LlmProvider for GitHubCopilotProvider {
 
         let http_resp = self
             .client
-            .post(format!("{COPILOT_API_BASE}/chat/completions"))
+            .post(format!("{api_base}/chat/completions"))
             .header("Authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
             .header("Editor-Version", EDITOR_VERSION)
@@ -539,7 +669,7 @@ impl LlmProvider for GitHubCopilotProvider {
         tools: Vec<serde_json::Value>,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
         Box::pin(async_stream::stream! {
-            let token = match self.get_valid_copilot_token().await {
+            let (token, api_base) = match self.get_valid_copilot_token().await {
                 Ok(t) => t,
                 Err(e) => {
                     yield StreamEvent::Error(e.to_string());
@@ -570,7 +700,7 @@ impl LlmProvider for GitHubCopilotProvider {
 
             let resp = match self
                 .client
-                .post(format!("{COPILOT_API_BASE}/chat/completions"))
+                .post(format!("{api_base}/chat/completions"))
                 .header("Authorization", format!("Bearer {token}"))
                 .header("content-type", "application/json")
                 .header("Editor-Version", EDITOR_VERSION)
@@ -849,6 +979,7 @@ mod tests {
         assert_eq!(EDITOR_VERSION, "vscode/1.96.2");
         assert!(!COPILOT_USER_AGENT.is_empty());
         assert_eq!(PROVIDER_NAME, "github-copilot");
+        assert_eq!(COPILOT_ENDPOINT_STORE_KEY, "github-copilot-endpoint");
     }
 
     // ── Integration tests with mock server ───────────────────────────────────
@@ -1066,5 +1197,115 @@ mod tests {
             !has_integration_id,
             "copilot-integration-id header should NOT be sent"
         );
+    }
+
+    // ── Enterprise endpoint tests ────────────────────────────────────────────
+
+    #[test]
+    fn copilot_token_response_parses_without_endpoints() {
+        let json = r#"{"token":"tok_123","expires_at":9999999999}"#;
+        let resp: CopilotTokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.token, "tok_123");
+        assert!(resp.endpoints.is_none());
+    }
+
+    #[test]
+    fn copilot_token_response_parses_individual_endpoints() {
+        let json = r#"{
+            "token": "tok_ind",
+            "expires_at": 9999999999,
+            "endpoints": {
+                "api": "https://api.individual.githubcopilot.com",
+                "origin-tracker": "https://origin-tracker.githubusercontent.com"
+            }
+        }"#;
+        let resp: CopilotTokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.endpoints.unwrap().api.unwrap(),
+            "https://api.individual.githubcopilot.com"
+        );
+    }
+
+    #[test]
+    fn copilot_token_response_parses_enterprise_proxy() {
+        let json = r#"{
+            "token": "tok_ent",
+            "expires_at": 9999999999,
+            "endpoints": {
+                "api": "https://proxy.enterprise.githubcopilot.com"
+            }
+        }"#;
+        let resp: CopilotTokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.endpoints.unwrap().api.unwrap(),
+            "https://proxy.enterprise.githubcopilot.com"
+        );
+    }
+
+    #[test]
+    fn copilot_token_response_ignores_unknown_fields() {
+        let json = r#"{
+            "token": "tok_extra",
+            "expires_at": 9999999999,
+            "sku": "copilot_for_business",
+            "individual": false,
+            "endpoints": { "api": "https://proxy.enterprise.githubcopilot.com" }
+        }"#;
+        let resp: CopilotTokenResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.token, "tok_extra");
+        assert_eq!(
+            resp.endpoints.unwrap().api.unwrap(),
+            "https://proxy.enterprise.githubcopilot.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_stream_response_assembles_text() {
+        let stream = async_stream::stream! {
+            yield StreamEvent::Delta("Hello".into());
+            yield StreamEvent::Delta(" world".into());
+            yield StreamEvent::Done(moltis_agents::model::Usage {
+                input_tokens: 5,
+                output_tokens: 2,
+                ..Default::default()
+            });
+        };
+        let resp = collect_stream_response(Box::pin(stream)).await.unwrap();
+        assert_eq!(resp.text.as_deref(), Some("Hello world"));
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(resp.usage.input_tokens, 5);
+        assert_eq!(resp.usage.output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn collect_stream_response_assembles_tool_calls() {
+        let stream = async_stream::stream! {
+            yield StreamEvent::ToolCallStart {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                index: 0,
+            };
+            yield StreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                delta: r#"{"path":"/tmp"}"#.into(),
+            };
+            yield StreamEvent::ToolCallComplete { index: 0 };
+            yield StreamEvent::Done(Default::default());
+        };
+        let resp = collect_stream_response(Box::pin(stream)).await.unwrap();
+        assert!(resp.text.is_none());
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        assert_eq!(resp.tool_calls[0].arguments["path"], "/tmp");
+    }
+
+    #[tokio::test]
+    async fn collect_stream_response_propagates_error() {
+        let stream = async_stream::stream! {
+            yield StreamEvent::Delta("partial".into());
+            yield StreamEvent::Error("server error".into());
+        };
+        let err = collect_stream_response(Box::pin(stream)).await.unwrap_err();
+        assert!(err.to_string().contains("server error"));
     }
 }
