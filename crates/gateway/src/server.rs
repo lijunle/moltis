@@ -320,7 +320,7 @@ fn should_prebuild_sandbox_image(
 
 fn instance_slug(config: &moltis_config::MoltisConfig) -> String {
     let mut raw_name = config.identity.name.clone();
-    if let Some(file_identity) = moltis_config::load_identity()
+    if let Some(file_identity) = moltis_config::load_identity_for_agent("main")
         && file_identity.name.is_some()
     {
         raw_name = file_identity.name;
@@ -703,7 +703,8 @@ pub fn build_gateway_base(
 ) -> (Router<AppState>, AppState) {
     let mut router = Router::new()
         .route("/health", get(health_handler))
-        .route("/ws/chat", get(ws_upgrade_handler));
+        .route("/ws/chat", get(ws_upgrade_handler))
+        .route("/ws", get(ws_upgrade_handler));
 
     // Nest auth routes if credential store is available.
     if let Some(ref cred_store) = state.credential_store {
@@ -759,7 +760,8 @@ pub fn build_gateway_base(
 ) -> (Router<AppState>, AppState) {
     let mut router = Router::new()
         .route("/health", get(health_handler))
-        .route("/ws/chat", get(ws_upgrade_handler));
+        .route("/ws/chat", get(ws_upgrade_handler))
+        .route("/ws", get(ws_upgrade_handler));
 
     // Add Prometheus metrics endpoint (unauthenticated for scraping).
     #[cfg(feature = "prometheus")]
@@ -1366,6 +1368,11 @@ pub struct PreparedGateway {
     /// the `trusted-network` feature is enabled and the proxy is active).
     #[cfg(feature = "trusted-network")]
     pub audit_buffer: Option<crate::network_audit::NetworkAuditBuffer>,
+    /// Shutdown sender for the trusted-network proxy.  Retained here so the
+    /// proxy task is not cancelled when `prepare_gateway` returns (dropping
+    /// the sender closes the watch channel and triggers immediate shutdown).
+    #[cfg(feature = "trusted-network")]
+    _proxy_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 /// Internal metadata for the startup banner printed by [`start_gateway`].
@@ -2335,6 +2342,8 @@ pub async fn prepare_gateway(
     #[cfg(feature = "trusted-network")]
     let proxy_url_for_tools: Option<String>;
     #[cfg(feature = "trusted-network")]
+    let proxy_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>;
+    #[cfg(feature = "trusted-network")]
     {
         let (audit_tx, audit_rx) =
             tokio::sync::mpsc::channel::<moltis_network_filter::NetworkAuditEntry>(1024);
@@ -2359,7 +2368,7 @@ pub async fn prepare_gateway(
                 Arc::clone(&domain_mgr),
                 Some(audit_tx.clone()),
             );
-            let (_proxy_shutdown_tx, proxy_shutdown_rx) = tokio::sync::watch::channel(false);
+            let (shutdown_tx, proxy_shutdown_rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
                 if let Err(e) = proxy.run(proxy_shutdown_rx).await {
                     tracing::warn!("network proxy exited: {e}");
@@ -2375,12 +2384,14 @@ pub async fn prepare_gateway(
             );
             moltis_tools::init_shared_http_client(Some(&url));
             proxy_url_for_tools = Some(url);
+            proxy_shutdown_tx = Some(shutdown_tx);
         } else {
             info!(
                 network_policy = ?sandbox_config.network,
                 "trusted-network proxy not started (policy is not Trusted)"
             );
             proxy_url_for_tools = None;
+            proxy_shutdown_tx = None;
         }
 
         // Create the live network audit service from the receiver channel.
@@ -4948,6 +4959,8 @@ pub async fn prepare_gateway(
         },
         #[cfg(feature = "trusted-network")]
         audit_buffer: audit_buffer_for_broadcast,
+        #[cfg(feature = "trusted-network")]
+        _proxy_shutdown_tx: proxy_shutdown_tx,
     })
 }
 
