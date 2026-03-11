@@ -288,6 +288,8 @@ pub struct GatewayInner {
     pub passkey_host_update_pending: HashSet<String>,
     /// Shiki CDN URL override from config (`server.shiki_cdn_url`), or `None` for default.
     pub shiki_cdn_url: Option<String>,
+    /// Shared tool registry for dynamic tool registration (node tools, MCP tools).
+    pub tool_registry: Option<Arc<RwLock<moltis_agents::tool_registry::ToolRegistry>>>,
 }
 
 impl GatewayInner {
@@ -322,6 +324,7 @@ impl GatewayInner {
             channels_offered: vec!["telegram".into()],
             passkey_host_update_pending: HashSet::new(),
             shiki_cdn_url: None,
+            tool_registry: None,
         }
     }
 
@@ -523,6 +526,14 @@ impl GatewayState {
     /// Set a late-bound chat service (for circular init).
     pub async fn set_chat(&self, chat: Arc<dyn crate::services::ChatService>) {
         self.inner.write().await.chat_override = Some(chat);
+    }
+
+    /// Store the shared tool registry for dynamic tool registration.
+    pub async fn set_tool_registry(
+        &self,
+        registry: Arc<RwLock<moltis_agents::tool_registry::ToolRegistry>>,
+    ) {
+        self.inner.write().await.tool_registry = Some(registry);
     }
 
     /// Set the push notification service (late-bound initialization).

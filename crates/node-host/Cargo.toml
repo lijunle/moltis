@@ -10,6 +10,7 @@ metrics = ["dep:moltis-metrics"]
 [dependencies]
 anyhow            = { workspace = true }
 futures           = { workspace = true }
+moltis-config     = { workspace = true }
 moltis-metrics    = { optional = true, workspace = true }
 moltis-protocol   = { workspace = true }
 reqwest           = { workspace = true }
@@ -24,6 +25,7 @@ uuid              = { workspace = true }
 which             = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { features = ["macros", "rt-multi-thread"], workspace = true }
 
 [lints]

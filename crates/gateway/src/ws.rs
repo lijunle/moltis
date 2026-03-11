@@ -85,6 +85,7 @@ pub async fn handle_connection(
         request_id,
         params,
         is_v4,
+        tool_defs,
     } = connect_result;
 
     if state.ws_request_logs {
@@ -440,9 +441,21 @@ pub async fn handle_connection(
             disk_available: None,
             runtimes: Vec::new(),
             providers: Vec::new(),
+            tool_defs,
         };
-        state.inner.write().await.nodes.register(node);
+
+        // Register node in registry first, then advertise tools (so tool
+        // invocations can always find the node).
+        state.inner.write().await.nodes.register(node.clone());
         info!(conn_id = %conn_id, node_id = %params.client.id, "node registered");
+
+        // Register node-advertised tools into the shared tool registry.
+        {
+            let inner = state.inner.read().await;
+            if let Some(ref registry) = inner.tool_registry {
+                crate::node_tools::on_node_connect(registry, &node, &state).await;
+            }
+        }
 
         // Broadcast presence change.
         broadcast(
@@ -593,7 +606,18 @@ pub async fn handle_connection(
 
     // ── Cleanup ──────────────────────────────────────────────────────────
 
-    // Unregister node if applicable.
+    // Unregister node tools first (while node is still in registry), then
+    // remove the node itself. This ensures no tool can be invoked after its
+    // node is gone.
+    {
+        let inner = state.inner.read().await;
+        if let Some(node_id) = inner.nodes.node_id_by_conn(&conn_id) {
+            if let Some(ref registry) = inner.tool_registry {
+                crate::node_tools::on_node_disconnect(registry, node_id).await;
+            }
+        }
+    }
+
     let removed_node = state.inner.write().await.nodes.unregister_by_conn(&conn_id);
     if let Some(node) = &removed_node {
         info!(conn_id = %conn_id, node_id = %node.node_id, "node unregistered");
@@ -633,6 +657,8 @@ struct ConnectResult {
     request_id: String,
     params: ConnectParams,
     is_v4: bool,
+    /// Tool definitions from v4 extensions (RFC 391).
+    tool_defs: Vec<moltis_node_host::NodeToolSchema>,
 }
 
 async fn graceful_writer_shutdown(
@@ -664,10 +690,18 @@ async fn wait_for_connect(
 
                 // Try v4 format first (has `protocol` object instead of flat fields).
                 if let Ok(v4) = serde_json::from_value::<ConnectParamsV4>(raw.clone()) {
+                    // Extract tool definitions from extensions before conversion.
+                    let tool_defs: Vec<moltis_node_host::NodeToolSchema> = v4
+                        .extensions
+                        .get("moltis")
+                        .and_then(|m| m.get("tools"))
+                        .and_then(|t| serde_json::from_value(t.clone()).ok())
+                        .unwrap_or_default();
                     return Ok(ConnectResult {
                         request_id: req.id,
                         params: v4.into_connect_params(),
                         is_v4: true,
+                        tool_defs,
                     });
                 }
 
@@ -677,6 +711,7 @@ async fn wait_for_connect(
                     request_id: req.id,
                     params,
                     is_v4: false,
+                    tool_defs: Vec::new(),
                 });
             },
             _ => anyhow::bail!("first message must be a request frame"),

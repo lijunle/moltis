@@ -3916,6 +3916,12 @@ pub async fn prepare_gateway(
             .await;
         crate::mcp_service::sync_mcp_tools(live_mcp.manager(), &shared_tool_registry).await;
 
+        // Store tool registry in state so node connect/disconnect can register
+        // node-advertised tools dynamically.
+        state
+            .set_tool_registry(Arc::clone(&shared_tool_registry))
+            .await;
+
         // Log registered tools for debugging.
         let schemas = shared_tool_registry.read().await.list_schemas();
         let tool_names: Vec<&str> = schemas.iter().filter_map(|s| s["name"].as_str()).collect();

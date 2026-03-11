@@ -26,6 +26,8 @@ pub enum ToolSource {
     Mcp { server: String },
     /// Tool provided by a precompiled WASM component.
     Wasm { component_hash: [u8; 32] },
+    /// Tool advertised by a connected remote node.
+    Node { node_id: String },
 }
 
 /// Internal entry pairing a tool with its source metadata.
@@ -80,6 +82,24 @@ impl ToolRegistry {
             tool: Arc::from(tool),
             source: ToolSource::Wasm { component_hash },
         });
+    }
+
+    /// Register a tool advertised by a remote node.
+    pub fn register_node(&mut self, tool: Box<dyn AgentTool>, node_id: String) {
+        let name = tool.name().to_string();
+        self.tools.insert(name, ToolEntry {
+            tool: Arc::from(tool),
+            source: ToolSource::Node { node_id },
+        });
+    }
+
+    /// Remove all tools from a specific node. Returns the number of tools removed.
+    pub fn unregister_node(&mut self, node_id: &str) -> usize {
+        let before = self.tools.len();
+        self.tools.retain(|_, entry| {
+            !matches!(&entry.source, ToolSource::Node { node_id: nid } if nid == node_id)
+        });
+        before - self.tools.len()
     }
 
     /// Replace an existing tool by name, preserving its source metadata.
@@ -142,6 +162,10 @@ impl ToolRegistry {
                         schema["source"] = serde_json::json!("wasm");
                         schema["componentHash"] =
                             serde_json::json!(hex_component_hash(*component_hash));
+                    },
+                    ToolSource::Node { node_id } => {
+                        schema["source"] = serde_json::json!("node");
+                        schema["nodeId"] = serde_json::json!(node_id);
                     },
                 }
                 schema

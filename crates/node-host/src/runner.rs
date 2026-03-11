@@ -1,6 +1,6 @@
 //! WebSocket client that connects to a gateway as a headless node.
 
-use std::{process::Stdio, time::Duration};
+use std::{collections::HashMap, process::Stdio, time::Duration};
 
 use {
     futures::{SinkExt, StreamExt},
@@ -12,6 +12,11 @@ use {
 use moltis_protocol::{
     ClientInfo, ConnectAuth, ConnectParamsV4, GatewayFrame, PROTOCOL_VERSION, ProtocolRange,
     RequestFrame, ResponseFrame, roles,
+};
+
+use crate::tool_def::{
+    ExecHandler, HttpHandler, NodeToolDef, NodeToolSchema, StderrMode, ToolHandler,
+    substitute_params, tail_lines,
 };
 
 /// Configuration for connecting a node to a gateway.
@@ -118,11 +123,27 @@ fn collect_system_telemetry(node_id: &str) -> serde_json::Value {
 /// A headless node host that connects to a gateway and handles commands.
 pub struct NodeHost {
     config: NodeConfig,
+    /// Custom tools loaded from `~/.moltis/node-tools/`.
+    custom_tools: HashMap<String, NodeToolDef>,
 }
 
 impl NodeHost {
     pub fn new(config: NodeConfig) -> Self {
-        Self { config }
+        let tools_dir = moltis_config::data_dir().join("node-tools");
+        let custom_tools = crate::tool_loader::load_tools(&tools_dir);
+        Self {
+            config,
+            custom_tools,
+        }
+    }
+
+    /// Create a `NodeHost` with pre-loaded tools (for testing).
+    #[cfg(test)]
+    fn with_tools(config: NodeConfig, custom_tools: HashMap<String, NodeToolDef>) -> Self {
+        Self {
+            config,
+            custom_tools,
+        }
     }
 
     /// Connect to the gateway and run the message loop until disconnected.
@@ -166,14 +187,24 @@ impl NodeHost {
             locale: None,
             timezone: None,
             extensions: {
-                let mut ext = std::collections::HashMap::new();
-                ext.insert(
-                    "moltis".into(),
-                    serde_json::json!({
-                        "caps": self.config.caps,
-                        "commands": self.config.commands,
-                    }),
-                );
+                let mut ext = HashMap::new();
+                let tool_schemas: Vec<NodeToolSchema> = self
+                    .custom_tools
+                    .values()
+                    .map(NodeToolSchema::from)
+                    .collect();
+                let mut moltis_ext = serde_json::json!({
+                    "caps": self.config.caps,
+                    "commands": self.config.commands,
+                });
+                if !tool_schemas.is_empty() {
+                    moltis_ext["tools"] = serde_json::to_value(&tool_schemas).unwrap_or_default();
+                    info!(
+                        count = tool_schemas.len(),
+                        "advertising node tools in handshake"
+                    );
+                }
+                ext.insert("moltis".into(), moltis_ext);
                 ext
             },
         };
@@ -336,8 +367,12 @@ impl NodeHost {
             "system.which" => self.handle_system_which(&args).await,
             "system.providers" => self.handle_system_providers().await,
             other => {
-                warn!(command = %other, "unsupported invoke command");
-                Err(anyhow::anyhow!("unsupported command: {other}"))
+                if let Some(tool) = self.custom_tools.get(other) {
+                    self.execute_tool_handler(tool, &args).await
+                } else {
+                    warn!(command = %other, "unsupported invoke command");
+                    Err(anyhow::anyhow!("unsupported command: {other}"))
+                }
             },
         };
 
@@ -480,6 +515,127 @@ impl NodeHost {
         }
 
         Ok(serde_json::json!({ "providers": providers }))
+    }
+
+    // ── Custom tool execution ───────────────────────────────────────────
+
+    async fn execute_tool_handler(
+        &self,
+        tool: &NodeToolDef,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        info!(tool = %tool.name, "executing custom tool");
+        match &tool.handler {
+            ToolHandler::Exec(handler) => self.execute_exec_handler(handler, args).await,
+            ToolHandler::Http(handler) => self.execute_http_handler(handler, args).await,
+        }
+    }
+
+    async fn execute_exec_handler(
+        &self,
+        handler: &ExecHandler,
+        params: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut cmd = Command::new(&handler.program);
+
+        for arg_template in &handler.args {
+            let resolved = substitute_params(arg_template, params);
+            cmd.arg(resolved);
+        }
+
+        if let Some(ref cwd_template) = handler.cwd {
+            let cwd = substitute_params(cwd_template, params);
+            cmd.current_dir(cwd);
+        } else if let Some(ref dir) = self.config.working_dir {
+            cmd.current_dir(dir);
+        }
+
+        for (k, v) in &handler.env {
+            cmd.env(k, substitute_params(v, params));
+        }
+
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+
+        if handler.stderr == StderrMode::Merge {
+            cmd.stderr(Stdio::piped());
+        } else {
+            cmd.stderr(Stdio::piped());
+        }
+
+        let timeout = Duration::from_secs(handler.timeout_secs);
+        let child = cmd.spawn()?;
+        let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+
+        match result {
+            Ok(Ok(output)) => {
+                let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let exit_code = output.status.code().unwrap_or(-1);
+
+                if handler.stderr == StderrMode::Merge && !stderr.is_empty() {
+                    stdout.push('\n');
+                    stdout.push_str(&stderr);
+                }
+
+                if let Some(max_lines) = handler.max_output_lines {
+                    stdout = tail_lines(&stdout, max_lines);
+                }
+
+                let mut result = serde_json::json!({
+                    "stdout": stdout,
+                    "exitCode": exit_code,
+                });
+
+                if handler.stderr == StderrMode::Separate {
+                    result["stderr"] = serde_json::json!(stderr);
+                }
+
+                Ok(result)
+            },
+            Ok(Err(e)) => Err(anyhow::anyhow!(
+                "failed to execute {}: {e}",
+                handler.program
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "tool timed out after {}s",
+                handler.timeout_secs
+            )),
+        }
+    }
+
+    async fn execute_http_handler(
+        &self,
+        handler: &HttpHandler,
+        params: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let client = reqwest::Client::new();
+        let timeout = Duration::from_secs(handler.timeout_secs);
+
+        let mut req = match handler.method.to_uppercase().as_str() {
+            "GET" => client.get(&handler.url),
+            "PUT" => client.put(&handler.url).json(params),
+            "PATCH" => client.patch(&handler.url).json(params),
+            "DELETE" => client.delete(&handler.url),
+            _ => client.post(&handler.url).json(params),
+        };
+
+        for (k, v) in &handler.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+
+        let resp = req.timeout(timeout).send().await?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+
+        // Try to parse as JSON; fall back to raw string.
+        let body_value = serde_json::from_str::<serde_json::Value>(&body)
+            .unwrap_or_else(|_| serde_json::json!(body));
+
+        Ok(serde_json::json!({
+            "status": status,
+            "body": body_value,
+        }))
     }
 
     async fn send_invoke_result(

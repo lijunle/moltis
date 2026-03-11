@@ -45,6 +45,7 @@ pub mod metrics_middleware;
 pub mod metrics_routes;
 pub mod network_audit;
 pub mod node_exec;
+pub mod node_tools;
 pub mod nodes;
 pub mod onboarding;
 pub mod pairing;

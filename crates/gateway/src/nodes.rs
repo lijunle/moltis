@@ -43,6 +43,8 @@ pub struct NodeSession {
     pub runtimes: Vec<String>,
     // ── Provider discovery (P1) ─────────────────────────────────────
     pub providers: Vec<NodeProviderEntry>,
+    // ── Advertised tools (RFC 391) ──────────────────────────────────
+    pub tool_defs: Vec<moltis_node_host::NodeToolSchema>,
 }
 
 /// Registry of connected device nodes and their capabilities.
@@ -80,6 +82,11 @@ impl NodeRegistry {
 
     pub fn get(&self, node_id: &str) -> Option<&NodeSession> {
         self.nodes.get(node_id)
+    }
+
+    /// Look up a node_id by its connection id (without removing it).
+    pub fn node_id_by_conn(&self, conn_id: &str) -> Option<&str> {
+        self.by_conn.get(conn_id).map(|s| s.as_str())
     }
 
     pub fn get_mut(&mut self, node_id: &str) -> Option<&mut NodeSession> {

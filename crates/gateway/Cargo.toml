@@ -42,6 +42,7 @@ moltis-memory          = { workspace = true }
 moltis-metrics         = { optional = true, workspace = true }
 moltis-msteams         = { workspace = true }
 moltis-network-filter  = { features = ["proxy", "service"], optional = true, workspace = true }
+moltis-node-host       = { workspace = true }
 moltis-oauth           = { workspace = true }
 moltis-onboarding      = { workspace = true }
 moltis-openclaw-import = { optional = true, workspace = true }
